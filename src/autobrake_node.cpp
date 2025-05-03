@@ -3,16 +3,20 @@
 #include <sensor_msgs/msg/laser_scan.hpp>
 #include <ackermann_msgs/msg/ackermann_drive.hpp>
 #include "cev_msgs/msg/sensor_collect.hpp"
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <cmath>
+using std::placeholders::_1;
 class AutobrakeNode : public rclcpp::Node {
 public:
-    AutobrakeNode(): Node("autobrake") {
+    AutobrakeNode(): Node("autobrake"), tf_buffer_(this->get_clock()), tf_listener_(tf_buffer_) {
         timer_ = this->create_wall_timer(std::chrono::milliseconds(10),
-            std::bind(&AutobrakeNode::publishBrake, this));
+            std::bind(&AutobrakeNode::publishVelocity, this));
         sensor_collect_sub_ = this->create_subscription<cev_msgs::msg::SensorCollect>(
-            "sensor_collect", 1, std::bind(&AutobrakeNode::setVars, this, _1));
+            "sensor_collect", 1, std::bind(&AutobrakeNode::updateSensor, this, _1));
         scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>("scan", 1,
-            std::bind(&AutobrakeNode::checkCollision, this, _1));
+            std::bind(&AutobrakeNode::updateLidar, this, _1));
     }
 private:  // TODO: Make these constants configurable and use transforms instead of direct lidar
     const float VEHICLE_LENGTH = 0.185;
@@ -23,69 +27,60 @@ private:  // TODO: Make these constants configurable and use transforms instead 
     rclcpp::Subscription<ackermann_msgs::msg::AckermannDrive>::SharedPtr rc_movement_sub_;
     rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr forward_brake_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
+    tf2_ros::Buffer tf_buffer_;
+    tf2_ros::TransformListener tf_listener_;
+    sensor_msgs::msg::LaserScan::SharedPtr lidar_data_;
+    float velocity_;
+    float steering_angle_;
 
-    void publishVelocity(const sensor_msgs::msg::LaserScan::SharedPtr data) {
-        float distance = stopDistance(data);
+    void updateLidar(sensor_msgs::msg::LaserScan::SharedPtr data) {
+        lidar_data_=data;
+    }
+
+    void updateSensor(const cev_msgs::msg::SensorCollect::SharedPtr data) {
+        velocity_ = data->velocity;
+        steering_angle_ = data->steering_angle;
+    }
+
+    void publishVelocity() {
+        float distance = stopDistance(lidar_data_);
         float velocity = safeVelocity(distance);
         // publish
     }
 
     float stopDistance(const sensor_msgs::msg::LaserScan::SharedPtr data) {
-    float base_buffer = 5.0;
-    float look_ahead_distance = std::min(
-        self.lidar_range,
-        max(self.length * 1.5, abs(self.velocity) * 1.8)
-    );
-    float min_safe_distance = self.length * 0.75;
-    float half_length = VEHICLE_LENGTH / 2.0;
-    float half_width = VEHICLE_WIDTH / 2.0;
-    
-    float closest_arc = std::numeric_limits<float>::max(); 
+        // tune these
+        float base_buffer = 5.0;
+        float look_ahead_distance = std::min(
+            data->range_max,
+            static_cast<float>(std::max(VEHICLE_LENGTH * 1.5, std::abs(velocity_) * 1.8))
+        );
+        float min_safe_distance = VEHICLE_LENGTH * 0.75;
+        float half_length = VEHICLE_LENGTH / 2.0;
+        float half_width = VEHICLE_WIDTH / 2.0;
+        
+        float closest_arc = std::numeric_limits<float>::max(); 
 
-    float ch = std::cos(heading_);
-    float sh = std::sin(heading_);
+        geometry_msgs::msg::TransformStamped transform_stamped =
+        tf_buffer_.lookupTransform("base_link", "laser", tf2::TimePointZero);
+            for (int i = 0; i < data->ranges.length; i++) {
+                float angle = data->angle_min + i*data->angle_increment + tf_buffer_.
 
-    if (std::abs(steering_angle_)<0.1) {
-        for (const auto& p : lidar_points_) {
-            // transform from /tf
-            
-        }
-    }
-
-    if abs(self.steering_angle) < 1e-6:
-        dir = 1 if self.velocity >= 0 else -1
-        for px, py in self.lidar_points:
-            dx, dy = px - self.x, py - self.y
-            arc = (dx*ch + dy*sh) * dir
-            lateral = abs(-dx*sh + dy*ch)
-            if 0 <= arc < look_ahead_distance and lateral <= (half_width + base_buffer):
-                closest_arc = min(closest_arc, arc)
-
-    # Turning
-    else:
-        R = self.wheelbase / math.tan(abs(self.steering_angle))
-        turn_sign = 1 if self.steering_angle > 0 else -1
-        # self.x, self.y are the center of the car
-        # we use this reference point so the front edge of the car is entirely within the two circles
-        icr_x = self.x - turn_sign * R * math.sin(self.heading)
-        icr_y = self.y + turn_sign * R * math.cos(self.heading)
-        inner_rad = R-half_width
-        outer_rad = math.hypot(R+half_width, half_length)
-        motion_dir = 1 if self.velocity >= 0 else -1
-        travel_sign = turn_sign * motion_dir
-        turn_factor = max(0.3, 1 - abs(self.steering_angle) / math.pi)
-        buffer = base_buffer * turn_factor
-
-        angular_span = look_ahead_distance / R
-        theta0 = math.atan2(self.y - icr_y, self.x - icr_x)
-        for px, py in self.lidar_points:
-            point_radius = math.hypot(px-icr_x, py-icr_y)
-            if (outer_rad + buffer) > point_radius > (inner_rad - buffer):
-                theta_p = math.atan2(py - icr_y, px - icr_x)
-                delta = (theta_p - theta0) * travel_sign % (2 * math.pi)
-                arc = delta * R
-                if arc < look_ahead_distance:
-                    closest_arc = min(closest_arc, arc)
+                if (std::abs(steering_angle_)<0.1) {
+                    // dir = 1 if self.velocity >= 0 else -1
+                    // for px, py in self.lidar_points:
+                    //     dx, dy = px - self.x, py - self.y
+                    //     arc = (dx*ch + dy*sh) * dir
+                    //     lateral = abs(-dx*sh + dy*ch)
+                    //     if 0 <= arc < look_ahead_distance and lateral <= (half_width + base_buffer):
+                    //         closest_arc = min(closest_arc, arc)
+                } else {
+                // calculate center
+                // transform via laser to base_link
+                // do calculations based on new center of mass
+                return -1.0;
+                }
+            }
     }
 
     float safeVelocity(float distance) {
@@ -100,11 +95,6 @@ private:  // TODO: Make these constants configurable and use transforms instead 
         factor = max(0.0, min(1.0, factor))
     
         return self.max_velocity * factor * (1 if self.velocity >= 0 else -1)
-    }
-
-    void setVars(const cev_msgs::msg::SensorCollect::SharedPtr data) {
-        velocity_ = data->velocity;
-        steering_angle_ = data->steering_angle;
     }
 }
 int main(int argc, char* argv[]) {
